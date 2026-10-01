@@ -1,0 +1,179 @@
+package desu.inugram.core.sticker
+
+import org.junit.Assert.*
+import org.junit.Test
+import kotlin.math.*
+
+class StickerFitTest {
+    private fun rectangle(l: Double, t: Double, r: Double, b: Double) = listOf(
+        StickerFit.Point(l, t), StickerFit.Point(r, t), StickerFit.Point(r, b), StickerFit.Point(l, b),
+    )
+
+    @Test fun opaqueSquareRespectsRoundedCorners() {
+        val points = rectangle(-256.0, -256.0, 256.0, 256.0)
+        val fit = StickerFit.fit(points, 0.0, 512.0)!!
+        assertTrue(fit.scale < .94)
+        assertContained(points, 0.0, fit)
+        assertFalse(StickerFit.contains(256.0 * fit.scale * 1.001, 256.0 * fit.scale * 1.001, 512.0, 1.0))
+    }
+
+    @Test fun growsSmallContentAndCentersOffCenterSubject() {
+        val points = rectangle(700.0, -35.0, 720.0, 5.0)
+        val fit = StickerFit.fit(points, 0.0, 512.0)!!
+        assertTrue(fit.scale > 10)
+        assertEquals(-710 * fit.scale, fit.translationX, 1e-6)
+        assertEquals(15 * fit.scale, fit.translationY, 1e-6)
+        assertContained(points, 0.0, fit)
+    }
+
+    @Test fun transparentMarginsAndLowAlphaPixelsAreHandled() {
+        val pixels = IntArray(100 * 80)
+        pixels[40 * 100 + 70] = 0x01000000
+        val support = StickerFit.support(listOf(StickerFit.Layer(pixels, 100, 80, StickerFit.Affine())), emptyList(), null)
+        assertEquals(69.5, support.minOf { it.x }, 0.0)
+        assertEquals(71.5, support.maxOf { it.x }, 0.0)
+        assertTrue(StickerFit.fit(support, 0.0, 512.0)!!.scale > 100)
+    }
+
+    @Test fun detachedAlphaSpecksDoNotLimitAngledContent() {
+        val width = 40
+        val height = 62
+        val clean = IntArray(width * height)
+        for (y in 0 until height) {
+            val left = max(0, 6 - y / 3)
+            val right = if (y < 8) 6 + y * 2 else 39
+            for (x in left..right) clean[y * width + x] = -1
+        }
+        // Like the supplied PNG: the speck is inside the unrotated bounds,
+        // but far outside the visible silhouette after rotation.
+        val noisy = clean.copyOf().apply { this[2 * width + 33] = 0x01000000 }
+        val matrix = StickerFit.Affine(tx = -width / 2.0, ty = -height / 2.0)
+        fun support(pixels: IntArray, ignore: Boolean) = StickerFit.support(
+            listOf(StickerFit.Layer(pixels, width, height, matrix)), emptyList(), null, ignore,
+        )
+        val expected = support(clean, false)
+        val filtered = support(noisy, true)
+        val unfiltered = support(noisy, false)
+        assertEquals(expected, filtered)
+        for (angle in listOf(145.9, -18.47, 71.36)) {
+            val fit = StickerFit.fit(filtered, angle, 512.0)!!
+            assertContained(expected, angle, fit)
+            assertEquals(StickerFit.fit(expected, angle, 512.0), fit)
+            assertTrue(fit.scale > StickerFit.fit(unfiltered, angle, 512.0)!!.scale * 1.01)
+        }
+        for (angle in listOf(0.0, 90.0, 180.0, 270.0)) {
+            assertEquals(StickerFit.fit(unfiltered, angle, 512.0), StickerFit.fit(filtered, angle, 512.0))
+        }
+    }
+
+    @Test fun speckFilteringPreservesConnectedFaintEdges() {
+        val pixels = IntArray(30 * 30)
+        pixels[0] = -1
+        // The faint edge extends beyond the flood-fill queue and connects diagonally.
+        for (i in 1..25) pixels[i * 30 + i] = 0x01000000
+        val layer = StickerFit.Layer(pixels, 30, 30, StickerFit.Affine())
+        assertEquals(
+            StickerFit.support(listOf(layer), emptyList(), null),
+            StickerFit.support(listOf(layer), emptyList(), null, true),
+        )
+    }
+
+    @Test fun speckFilteringPreservesLargerFaintRegionsAndVisibleDots() {
+        val pixels = IntArray(40 * 3)
+        pixels[40] = -1
+        for (x in 10..26) pixels[40 + x] = 0x02000000
+        pixels[39] = 0x03000000
+        val layer = StickerFit.Layer(pixels, 40, 3, StickerFit.Affine())
+        assertEquals(
+            StickerFit.support(listOf(layer), emptyList(), null),
+            StickerFit.support(listOf(layer), emptyList(), null, true),
+        )
+    }
+
+    @Test fun speckFilteringPreservesWhollyFaintLayers() {
+        val pixels = IntArray(100 * 80)
+        pixels[40 * 100 + 70] = 0x01000000
+        val layer = StickerFit.Layer(pixels, 100, 80, StickerFit.Affine())
+        assertEquals(
+            StickerFit.support(listOf(layer), emptyList(), null),
+            StickerFit.support(listOf(layer), emptyList(), null, true),
+        )
+    }
+
+    @Test fun cropDoesNotRestoreTransparentOrErasedContent() {
+        val pixels = intArrayOf(-1, 0, 0, -1)
+        val layer = StickerFit.Layer(pixels, 4, 1, StickerFit.Affine())
+        assertTrue(StickerFit.support(listOf(layer), emptyList(), StickerFit.Rect(1.6, 0.0, 2.4, 1.0)).isEmpty())
+        val clipped = StickerFit.support(listOf(layer), emptyList(), StickerFit.Rect(0.0, 0.0, 1.0, 1.0))
+        assertEquals(0.0, clipped.minOf { it.x }, 0.0)
+        assertEquals(1.0, clipped.maxOf { it.x }, 0.0)
+    }
+
+    @Test fun everyAnglePreservesContainmentAndMaximizesScale() {
+        val points = rectangle(-140.0, -40.0, 120.0, 60.0)
+        for (angle in listOf(-180.0, -179.0, -90.0, -45.0, 0.0, 23.0, 45.0, 90.0, 179.0, 180.0)) {
+            val fit = StickerFit.fit(points, angle, 512.0)!!
+            assertContained(points, angle, fit)
+            val radians = angle * PI / 180
+            val violates = points.any {
+                val x = (cos(radians) * it.x - sin(radians) * it.y) * fit.scale + fit.translationX
+                val y = (sin(radians) * it.x + cos(radians) * it.y) * fit.scale + fit.translationY
+                !StickerFit.contains(x * 1.001, y * 1.001, 512.0, 1.0)
+            }
+            assertTrue("not maximal at $angle", violates)
+        }
+    }
+
+    @Test fun fullAnimatedLayerBoundsParticipateInFit() {
+        val base = rectangle(-10.0, -10.0, 10.0, 10.0)
+        val overlay = rectangle(400.0, -80.0, 800.0, 80.0)
+        val combined = StickerFit.support(emptyList(), listOf(base, overlay), null)
+        val fit = StickerFit.fit(combined, 45.0, 512.0)!!
+        assertContained(base + overlay, 45.0, fit)
+        assertTrue(fit.scale < StickerFit.fit(base, 45.0, 512.0)!!.scale)
+    }
+
+    @Test fun angledAlphaContentUsesTransparentCornersInsteadOfItsBoundingBox() {
+        val pixels = IntArray(41 * 41) { index ->
+            if (abs(index % 41 - 20) + abs(index / 41 - 20) <= 20) -1 else 0
+        }
+        val matrix = StickerFit.Affine(a = 10.0, d = 10.0, tx = -205.0, ty = -205.0)
+        val points = StickerFit.support(listOf(StickerFit.Layer(pixels, 41, 41, matrix)), emptyList(), null)
+        val bounds = rectangle(-205.0, -205.0, 205.0, 205.0)
+        for (angle in listOf(23.0, 37.0, 74.0, -137.0, 196.0)) {
+            val fit = StickerFit.fit(points, angle, 512.0)!!
+            assertContained(points, angle, fit)
+            assertTrue("transparent corners wasted at $angle", fit.scale > StickerFit.fit(bounds, angle, 512.0)!!.scale * 1.1)
+        }
+    }
+
+    @Test fun extremeAspectRatiosAreNotClampedToStockLimits() {
+        val fit = StickerFit.fit(rectangle(-1e6, -1.0, 1e6, 1.0), 0.0, 512.0)!!
+        assertTrue(fit.scale > 0 && fit.scale < .33)
+    }
+
+    @Test fun fitIsIndependentOfPreviewSizeAndIdempotent() {
+        val points = rectangle(-120.0, -180.0, 120.0, 180.0)
+        val a = StickerFit.fit(points, 37.0, 512.0)!!
+        val b = StickerFit.fit(points.map { StickerFit.Point(it.x * .5, it.y * .5) }, 37.0, 256.0)!!
+        assertEquals(a.scale, b.scale, 1e-9)
+        assertEquals(a.translationX * .5, b.translationX, 1e-9)
+        assertEquals(a, StickerFit.fit(points, 37.0, 512.0))
+    }
+
+    @Test fun emptyOrInvalidGeometryDoesNotFit() {
+        assertNull(StickerFit.fit(emptyList(), 0.0, 512.0))
+        assertNull(StickerFit.fit(rectangle(0.0, 0.0, 1.0, 1.0), 0.0, 0.0))
+        assertNull(StickerFit.fit(listOf(StickerFit.Point(Double.NaN, 1.0)), 0.0, 512.0))
+    }
+
+    private fun assertContained(points: List<StickerFit.Point>, angle: Double, fit: StickerFit.Result) {
+        val radians = angle * PI / 180
+        for (p in points) {
+            val x = (cos(radians) * p.x - sin(radians) * p.y) * fit.scale + fit.translationX
+            val y = (sin(radians) * p.x + cos(radians) * p.y) * fit.scale + fit.translationY
+            // Centering and applying translation can differ by a few floating-point ulps.
+            assertTrue("outside at $angle: $x, $y", StickerFit.contains(x, y, 512.0, 1.0 - 1e-7))
+        }
+    }
+}
