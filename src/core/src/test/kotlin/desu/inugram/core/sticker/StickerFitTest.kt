@@ -1,7 +1,10 @@
 package desu.inugram.core.sticker
 
 import org.junit.Assert.*
+import org.junit.Assume.assumeTrue
 import org.junit.Test
+import java.lang.management.ManagementFactory
+import java.util.Random
 import kotlin.math.*
 
 class StickerFitTest {
@@ -134,6 +137,108 @@ class StickerFitTest {
         val clipped = StickerFit.support(listOf(layer), emptyList(), StickerFit.Rect(0.0, 0.0, 1.0, 1.0))
         assertEquals(0.0, clipped.minOf { it.x }, 0.0)
         assertEquals(1.0, clipped.maxOf { it.x }, 0.0)
+    }
+
+    @Test fun rotatedCropDoesNotFillErasedGapsBetweenVisibleRuns() {
+        val width = 7
+        val pixels = IntArray(width * 3) { if (it % width == 0 || it % width == 6) -1 else 0 }
+        val c = cos(37.0 * PI / 180); val s = sin(37.0 * PI / 180)
+        val matrix = StickerFit.Affine(c, s, -s, c, -3.5 * c + 1.5 * s, -3.5 * s - 1.5 * c)
+        val crop = StickerFit.Rect(-.1, -.1, .1, .1)
+        assertTrue(StickerFit.support(listOf(layer(pixels, width, 3, matrix)), emptyList(), crop).isEmpty())
+        pixels[width + 3] = -1
+        val actual = StickerFit.support(listOf(layer(pixels, width, 3, matrix)), emptyList(), crop)
+        assertSameCoverage(rectangle(-.1, -.1, .1, .1), actual)
+    }
+
+    @Test fun boundaryQueriesMatchClippedPixelPolygons() {
+        val random = Random(55)
+        val angle = 89.999999 * PI / 180
+        val transforms = listOf(
+            StickerFit.Affine(tx = -4.0, ty = -3.0),
+            StickerFit.Affine(.8, .6, -.6, .8, -3.0, -5.0),
+            StickerFit.Affine(-1.7, .4, .5, .9, 8.0, -4.0),
+            StickerFit.Affine(0.0, 1.0, -1.0, 0.0, 4.0, -5.0),
+            StickerFit.Affine(cos(angle), sin(angle), -sin(angle), cos(angle), 4.0, -5.0),
+            StickerFit.Affine(1.0, .4, 2.0, .8, -5.0, -2.0),
+            StickerFit.Affine(0.0, 1.0, 0.0, 2.0, 0.0, -5.0),
+            StickerFit.Affine(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+        repeat(80) {
+            val width = 12; val height = 9
+            val alpha = ByteArray(width * height) { if (random.nextInt(4) == 0) 0 else -1 }
+            val left = random.nextDouble() * 16 - 8
+            val top = random.nextDouble() * 12 - 6
+            val crops = listOf(null, StickerFit.Rect(left, top, left + random.nextDouble() * 8, top + random.nextDouble() * 6))
+            for (matrix in transforms) for (crop in crops) {
+                val layer = StickerFit.Layer(alpha, width, height, matrix)
+                val expected = referenceSupport(layer, crop)
+                val actual = StickerFit.support(listOf(layer), emptyList(), crop)
+                assertSameCoverage(expected, actual)
+            }
+        }
+    }
+
+    @Test fun fragmentedNativeMaskHasBoundedGeometryAllocations() {
+        val bean = ManagementFactory.getThreadMXBean()
+        assumeTrue(bean is com.sun.management.ThreadMXBean)
+        val allocations = bean as com.sun.management.ThreadMXBean
+        assumeTrue(allocations.isThreadAllocatedMemorySupported)
+        allocations.isThreadAllocatedMemoryEnabled = true
+        val width = 4096; val height = 2048
+        val alpha = ByteArray(width * height) { if ((it % width + it / width) % 2 == 0) -1 else 0 }
+        val matrix = StickerFit.Affine(.8, .6, -.6, .8, -width * .4 + height * .3, -width * .3 - height * .4)
+        val layers = listOf(StickerFit.Layer(alpha, width, height, matrix))
+        for (crop in listOf(null, StickerFit.Rect(-256.0, -256.0, 256.0, 256.0))) {
+            val before = allocations.getThreadAllocatedBytes(Thread.currentThread().id)
+            val actual = StickerFit.support(layers, emptyList(), crop, ignoreAlphaSpecks = true)
+            val bytes = allocations.getThreadAllocatedBytes(Thread.currentThread().id) - before
+            assertTrue("Fragmented geometry allocated $bytes bytes", bytes < 32L * 1024 * 1024)
+            if (crop != null) assertSameCoverage(rectangle(-256.0, -256.0, 256.0, 256.0), actual)
+            else assertTrue(actual.isNotEmpty())
+        }
+    }
+
+    /** Independent oracle: clip each occupied pixel's expanded polygon before taking its hull. */
+    private fun referenceSupport(layer: StickerFit.Layer, crop: StickerFit.Rect?): List<StickerFit.Point> {
+        val points = ArrayList<StickerFit.Point>()
+        for (y in 0 until layer.height) for (x in 0 until layer.width) {
+            if (layer.alpha[y * layer.width + x].toInt() == 0) continue
+            var polygon = rectangle(x - .5, y - .5, x + 1.5, y + 1.5).map { layer.matrix.map(it.x, it.y) }
+            if (crop != null) for (edge in 0..3) {
+                val input = polygon
+                polygon = buildList {
+                    if (input.isEmpty()) return@buildList
+                    fun distance(p: StickerFit.Point) = when (edge) {
+                        0 -> p.x - crop.left; 1 -> crop.right - p.x
+                        2 -> p.y - crop.top; else -> crop.bottom - p.y
+                    }
+                    var previous = input.last(); var pd = distance(previous)
+                    for (current in input) {
+                        val cd = distance(current)
+                        if ((pd >= 0) != (cd >= 0)) {
+                            val t = pd / (pd - cd)
+                            add(StickerFit.Point(previous.x + t * (current.x - previous.x), previous.y + t * (current.y - previous.y)))
+                        }
+                        if (cd >= 0) add(current)
+                        previous = current; pd = cd
+                    }
+                }
+            }
+            points.addAll(polygon)
+        }
+        return StickerFit.hull(points)
+    }
+
+    private fun assertSameCoverage(expected: List<StickerFit.Point>, actual: List<StickerFit.Point>) {
+        assertEquals("Empty coverage differs", expected.isEmpty(), actual.isEmpty())
+        if (expected.isEmpty()) return
+        for (angle in 0 until 360 step 5) {
+            val c = cos(angle * PI / 180); val s = sin(angle * PI / 180)
+            fun projection(p: StickerFit.Point) = p.x * c + p.y * s
+            assertEquals("Minimum support differs at $angle", expected.minOf(::projection), actual.minOf(::projection), 1e-8)
+            assertEquals("Maximum support differs at $angle", expected.maxOf(::projection), actual.maxOf(::projection), 1e-8)
+        }
     }
 
     @Test fun everyAnglePreservesContainmentAndMaximizesScale() {

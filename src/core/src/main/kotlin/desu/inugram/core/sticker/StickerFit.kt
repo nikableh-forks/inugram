@@ -34,34 +34,139 @@ object StickerFit {
         return alpha
     }
 
-    /** Pixel runs retain holes until after the committed crop has been applied. */
+    /** Retain coverage on row/crop boundaries before taking the composition's hull. */
     fun support(layers: List<Layer>, rectangles: List<List<Point>>, crop: Rect?, ignoreAlphaSpecks: Boolean = false): List<Point> {
-        val points = ArrayList<Point>()
-        fun add(polygon: List<Point>) { points.addAll(if (crop == null) polygon else clip(polygon, crop)) }
+        val points = SupportAccumulator()
         for (layer in layers) {
             require(layer.width > 0 && layer.height > 0 && layer.alpha.size.toLong() == layer.width.toLong() * layer.height)
-            val specks = if (ignoreAlphaSpecks) alphaSpecks(layer) else null
-            fun covered(index: Int) = layer.alpha[index].toInt() != 0 && specks?.get(index)?.toInt() != 2
+            CoverageBoundary(layer, if (ignoreAlphaSpecks) alphaSpecks(layer) else null, crop, points).collect()
+        }
+        for (polygon in rectangles) {
+            for (point in if (crop == null) polygon else clip(polygon, crop)) points.add(point)
+        }
+        return points.finish()
+    }
+
+    /** Keep only the actual hull plus a small pending batch, regardless of disconnected runs. */
+    private class SupportAccumulator {
+        private var boundary = emptyList<Point>()
+        private val pending = ArrayList<Point>(512)
+
+        fun add(point: Point) {
+            pending.add(point)
+            if (pending.size == 512) flush()
+        }
+
+        private fun flush() {
+            if (pending.isEmpty()) return
+            boundary = hull(boundary + pending)
+            pending.clear()
+        }
+
+        fun finish(): List<Point> { flush(); return boundary }
+    }
+
+    /**
+     * Every vertex of a clipped pixel run lies on a row edge or a crop edge.
+     * The first/last covered points on those six lines give the same hull without
+     * constructing a polygon for every run. Checking alpha along each line keeps
+     * holes and erased pixels intact even when the crop lies between visible runs.
+     */
+    private class CoverageBoundary(
+        private val layer: Layer,
+        private val specks: ByteArray?,
+        private val crop: Rect?,
+        private val points: SupportAccumulator,
+    ) {
+        private val m = layer.matrix
+        private var row = 0
+        private var first = 0
+        private var last = 0
+        private var from = 0.0
+        private var to = 1.0
+
+        private fun covered(x: Int) = layer.alpha[row * layer.width + x].toInt() != 0 &&
+            specks?.get(row * layer.width + x)?.toInt() != 2
+
+        fun collect() {
             for (y in 0 until layer.height) {
-                val row = ArrayList<Point>()
-                var x = 0
-                while (x < layer.width) {
-                    while (x < layer.width && !covered(y * layer.width + x)) x++
-                    val start = x
-                    while (x < layer.width && covered(y * layer.width + x)) x++
-                    if (x > start) {
-                        // Half a source pixel accounts for bilinear filtering at the edges.
-                        val l = start - .5; val r = x + .5; val t = y - .5; val b = y + 1.5
-                        val polygon = listOf(layer.matrix.map(l, t), layer.matrix.map(r, t), layer.matrix.map(r, b), layer.matrix.map(l, b))
-                        row.addAll(if (crop == null) polygon else clip(polygon, crop))
+                row = y
+                first = 0
+                while (first < layer.width && !covered(first)) first++
+                if (first == layer.width) continue
+                last = layer.width - 1
+                while (!covered(last)) last--
+                // Match the existing half-pixel allowance for bilinear filtering.
+                val l = first - .5; val r = last + 1.5
+                val t = y - .5; val b = y + 1.5
+                line(l, t, r, t)
+                line(l, b, r, b)
+                if (crop != null) {
+                    for (edge in 0..3) {
+                        val horizontal = edge >= 2
+                        val a = if (horizontal) m.b else m.a
+                        val c = if (horizontal) m.d else m.c
+                        val value = when (edge) {
+                            0 -> crop.left; 1 -> crop.right; 2 -> crop.top; else -> crop.bottom
+                        } - if (horizontal) m.ty else m.tx
+                        // Parameterize in the more stable source direction. No inverse
+                        // matrix is needed, including for mirrored or singular transforms.
+                        if (abs(c) >= abs(a) && c != 0.0) {
+                            line(l, (value - a * l) / c, r, (value - a * r) / c, edge)
+                        } else if (a != 0.0) {
+                            line((value - c * t) / a, t, (value - c * b) / a, b, edge)
+                        }
                     }
                 }
-                // Bound memory for noisy masks with many disconnected pixel runs.
-                points.addAll(hull(row))
             }
         }
-        rectangles.forEach(::add)
-        return hull(points)
+
+        private fun restrict(start: Double, end: Double, minimum: Double, maximum: Double): Boolean {
+            val delta = end - start
+            if (delta == 0.0) return start >= minimum && start <= maximum
+            val a = (minimum - start) / delta
+            val b = (maximum - start) / delta
+            from = max(from, min(a, b))
+            to = min(to, max(a, b))
+            return from <= to
+        }
+
+        private fun line(x0: Double, y0: Double, x1: Double, y1: Double, edge: Int = -1) {
+            from = 0.0; to = 1.0
+            if (edge >= 0 && (!restrict(x0, x1, first - .5, last + 1.5) ||
+                !restrict(y0, y1, row - .5, row + 1.5))) return
+            val u0 = m.a * x0 + m.c * y0 + m.tx; val u1 = m.a * x1 + m.c * y1 + m.tx
+            val v0 = m.b * x0 + m.d * y0 + m.ty; val v1 = m.b * x1 + m.d * y1 + m.ty
+            if (crop != null) {
+                // A crop edge's fixed coordinate is exact; don't reject it due to
+                // cancellation error when mapping its source-space equation back.
+                if ((edge < 0 || edge >= 2) && !restrict(u0, u1, crop.left, crop.right)) return
+                if (edge < 2 && !restrict(v0, v1, crop.top, crop.bottom)) return
+            }
+            val dx = x1 - x0
+            val xFrom = x0 + dx * from; val xTo = x0 + dx * to
+            val left = min(xFrom, xTo); val right = max(xFrom, xTo)
+            var start = max(first, ceil(left - 1.5).toInt())
+            var end = min(last, floor(right + .5).toInt())
+            while (start <= end && !covered(start)) start++
+            if (start > end) return
+            while (!covered(end)) end--
+            if (dx != 0.0) {
+                val a = (max(left, start - .5) - x0) / dx
+                val b = (min(right, end + 1.5) - x0) / dx
+                from = max(from, min(a, b))
+                to = min(to, max(a, b))
+            }
+            add(u0 + (u1 - u0) * from, v0 + (v1 - v0) * from, edge)
+            add(u0 + (u1 - u0) * to, v0 + (v1 - v0) * to, edge)
+        }
+
+        private fun add(x: Double, y: Double, edge: Int) {
+            points.add(Point(
+                when (edge) { 0 -> crop!!.left; 1 -> crop!!.right; else -> x },
+                when (edge) { 2 -> crop!!.top; 3 -> crop!!.bottom; else -> y },
+            ))
+        }
     }
 
     /** Ignore only detached specks under 1% opacity, never connected edges or wholly faint layers. */
