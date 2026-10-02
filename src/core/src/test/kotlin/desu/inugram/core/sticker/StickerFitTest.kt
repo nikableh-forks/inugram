@@ -9,6 +9,9 @@ class StickerFitTest {
         StickerFit.Point(l, t), StickerFit.Point(r, t), StickerFit.Point(r, b), StickerFit.Point(l, b),
     )
 
+    private fun layer(pixels: IntArray, width: Int, height: Int, matrix: StickerFit.Affine) =
+        StickerFit.Layer(ByteArray(pixels.size) { (pixels[it] ushr 24).toByte() }, width, height, matrix)
+
     @Test fun opaqueSquareRespectsRoundedCorners() {
         val points = rectangle(-256.0, -256.0, 256.0, 256.0)
         val fit = StickerFit.fit(points, 0.0, 512.0)!!
@@ -29,10 +32,34 @@ class StickerFitTest {
     @Test fun transparentMarginsAndLowAlphaPixelsAreHandled() {
         val pixels = IntArray(100 * 80)
         pixels[40 * 100 + 70] = 0x01000000
-        val support = StickerFit.support(listOf(StickerFit.Layer(pixels, 100, 80, StickerFit.Affine())), emptyList(), null)
+        val support = StickerFit.support(listOf(layer(pixels, 100, 80, StickerFit.Affine())), emptyList(), null)
         assertEquals(69.5, support.minOf { it.x }, 0.0)
         assertEquals(71.5, support.maxOf { it.x }, 0.0)
         assertTrue(StickerFit.fit(support, 0.0, 512.0)!!.scale > 100)
+    }
+
+    @Test fun unsignedAlphaCoveragePreservesAllOpacityLevels() {
+        val alpha = ByteArray(257) { if (it < 256) it.toByte() else 0 }
+        val layer = StickerFit.Layer(alpha, 257, 1, StickerFit.Affine())
+        val points = StickerFit.support(listOf(layer), emptyList(), null, ignoreAlphaSpecks = true)
+        assertEquals(.5, points.minOf { it.x }, 0.0)
+        assertEquals(256.5, points.maxOf { it.x }, 0.0)
+        assertEquals(StickerFit.support(listOf(layer), emptyList(), null), points)
+        val fit = StickerFit.fit(points, 37.0, 512.0)!!
+        assertContained(points, 37.0, fit)
+    }
+
+    @Test fun chunkedAlphaCopiesPreserveRowsAndPartialChunks() {
+        for ((width, height) in listOf(4 to 5, 7 to 2, 9 to 3, 1 to 21, 16385 to 3)) {
+            val buffer = IntArray(if (width > 100) 16384 else 7)
+            val source = IntArray(width * height) { ((it % 256) shl 24) or 0xabcdef }
+            val alpha = StickerFit.copyAlpha(width, height, buffer) { x, y, columns, rows ->
+                assertTrue(columns * rows <= buffer.size)
+                assertTrue(x + columns <= width && y + rows <= height)
+                for (row in 0 until rows) source.copyInto(buffer, row * columns, (y + row) * width + x, (y + row) * width + x + columns)
+            }
+            assertArrayEquals("$width x $height", ByteArray(source.size) { (source[it] ushr 24).toByte() }, alpha)
+        }
     }
 
     @Test fun detachedAlphaSpecksDoNotLimitAngledContent() {
@@ -49,7 +76,7 @@ class StickerFitTest {
         val noisy = clean.copyOf().apply { this[2 * width + 33] = 0x01000000 }
         val matrix = StickerFit.Affine(tx = -width / 2.0, ty = -height / 2.0)
         fun support(pixels: IntArray, ignore: Boolean) = StickerFit.support(
-            listOf(StickerFit.Layer(pixels, width, height, matrix)), emptyList(), null, ignore,
+            listOf(layer(pixels, width, height, matrix)), emptyList(), null, ignore,
         )
         val expected = support(clean, false)
         val filtered = support(noisy, true)
@@ -71,7 +98,7 @@ class StickerFitTest {
         pixels[0] = -1
         // The faint edge extends beyond the flood-fill queue and connects diagonally.
         for (i in 1..25) pixels[i * 30 + i] = 0x01000000
-        val layer = StickerFit.Layer(pixels, 30, 30, StickerFit.Affine())
+        val layer = layer(pixels, 30, 30, StickerFit.Affine())
         assertEquals(
             StickerFit.support(listOf(layer), emptyList(), null),
             StickerFit.support(listOf(layer), emptyList(), null, true),
@@ -83,7 +110,7 @@ class StickerFitTest {
         pixels[40] = -1
         for (x in 10..26) pixels[40 + x] = 0x02000000
         pixels[39] = 0x03000000
-        val layer = StickerFit.Layer(pixels, 40, 3, StickerFit.Affine())
+        val layer = layer(pixels, 40, 3, StickerFit.Affine())
         assertEquals(
             StickerFit.support(listOf(layer), emptyList(), null),
             StickerFit.support(listOf(layer), emptyList(), null, true),
@@ -93,7 +120,7 @@ class StickerFitTest {
     @Test fun speckFilteringPreservesWhollyFaintLayers() {
         val pixels = IntArray(100 * 80)
         pixels[40 * 100 + 70] = 0x01000000
-        val layer = StickerFit.Layer(pixels, 100, 80, StickerFit.Affine())
+        val layer = layer(pixels, 100, 80, StickerFit.Affine())
         assertEquals(
             StickerFit.support(listOf(layer), emptyList(), null),
             StickerFit.support(listOf(layer), emptyList(), null, true),
@@ -102,7 +129,7 @@ class StickerFitTest {
 
     @Test fun cropDoesNotRestoreTransparentOrErasedContent() {
         val pixels = intArrayOf(-1, 0, 0, -1)
-        val layer = StickerFit.Layer(pixels, 4, 1, StickerFit.Affine())
+        val layer = layer(pixels, 4, 1, StickerFit.Affine())
         assertTrue(StickerFit.support(listOf(layer), emptyList(), StickerFit.Rect(1.6, 0.0, 2.4, 1.0)).isEmpty())
         val clipped = StickerFit.support(listOf(layer), emptyList(), StickerFit.Rect(0.0, 0.0, 1.0, 1.0))
         assertEquals(0.0, clipped.minOf { it.x }, 0.0)
@@ -138,7 +165,7 @@ class StickerFitTest {
             if (abs(index % 41 - 20) + abs(index / 41 - 20) <= 20) -1 else 0
         }
         val matrix = StickerFit.Affine(a = 10.0, d = 10.0, tx = -205.0, ty = -205.0)
-        val points = StickerFit.support(listOf(StickerFit.Layer(pixels, 41, 41, matrix)), emptyList(), null)
+        val points = StickerFit.support(listOf(layer(pixels, 41, 41, matrix)), emptyList(), null)
         val bounds = rectangle(-205.0, -205.0, 205.0, 205.0)
         for (angle in listOf(23.0, 37.0, 74.0, -137.0, 196.0)) {
             val fit = StickerFit.fit(points, angle, 512.0)!!

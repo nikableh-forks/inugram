@@ -12,17 +12,36 @@ object StickerFit {
     ) {
         fun map(x: Double, y: Double) = Point(a * x + c * y + tx, b * x + d * y + ty)
     }
-    data class Layer(val pixels: IntArray, val width: Int, val height: Int, val matrix: Affine)
+    data class Layer(val alpha: ByteArray, val width: Int, val height: Int, val matrix: Affine)
     data class Result(val scale: Double, val translationX: Double, val translationY: Double)
+
+    /** The caller budgets the mask first. Read native pixels through one reusable ARGB buffer. */
+    fun copyAlpha(width: Int, height: Int, pixels: IntArray, read: (Int, Int, Int, Int) -> Unit): ByteArray {
+        val count = width.toLong() * height
+        require(width > 0 && height > 0 && count <= Int.MAX_VALUE && pixels.isNotEmpty())
+        val alpha = ByteArray(count.toInt())
+        var offset = 0
+        while (offset < alpha.size) {
+            val x = offset % width
+            val y = offset / width
+            val columns = min(pixels.size, width - x)
+            val rows = if (x == 0 && width <= pixels.size) min(pixels.size / columns, height - y) else 1
+            val length = columns * rows
+            read(x, y, columns, rows)
+            for (i in 0 until length) alpha[offset + i] = (pixels[i] ushr 24).toByte()
+            offset += length
+        }
+        return alpha
+    }
 
     /** Pixel runs retain holes until after the committed crop has been applied. */
     fun support(layers: List<Layer>, rectangles: List<List<Point>>, crop: Rect?, ignoreAlphaSpecks: Boolean = false): List<Point> {
         val points = ArrayList<Point>()
         fun add(polygon: List<Point>) { points.addAll(if (crop == null) polygon else clip(polygon, crop)) }
         for (layer in layers) {
-            require(layer.width > 0 && layer.height > 0 && layer.pixels.size == layer.width * layer.height)
+            require(layer.width > 0 && layer.height > 0 && layer.alpha.size.toLong() == layer.width.toLong() * layer.height)
             val specks = if (ignoreAlphaSpecks) alphaSpecks(layer) else null
-            fun covered(index: Int) = layer.pixels[index] ushr 24 != 0 && specks?.get(index)?.toInt() != 2
+            fun covered(index: Int) = layer.alpha[index].toInt() != 0 && specks?.get(index)?.toInt() != 2
             for (y in 0 until layer.height) {
                 val row = ArrayList<Point>()
                 var x = 0
@@ -51,18 +70,18 @@ object StickerFit {
         val maximumPixels = 16
         var hasFaint = false
         var hasVisible = false
-        for (pixel in layer.pixels) {
-            val alpha = pixel ushr 24
+        for (value in layer.alpha) {
+            val alpha = value.toInt() and 0xff
             if (alpha in 1..maximumAlpha) hasFaint = true
             if (alpha > maximumAlpha) hasVisible = true
             if (hasFaint && hasVisible) break
         }
         if (!hasFaint || !hasVisible) return null
         // 0 = unvisited, 1 = retained, 2 = speck, 3 = queued in the current region.
-        val states = ByteArray(layer.pixels.size)
+        val states = ByteArray(layer.alpha.size)
         val queue = IntArray(maximumPixels + 1)
-        for (start in layer.pixels.indices) {
-            if (states[start].toInt() != 0 || layer.pixels[start] ushr 24 !in 1..maximumAlpha) continue
+        for (start in layer.alpha.indices) {
+            if (states[start].toInt() != 0 || (layer.alpha[start].toInt() and 0xff) !in 1..maximumAlpha) continue
             queue[0] = start
             states[start] = 3
             var size = 1
@@ -75,7 +94,7 @@ object StickerFit {
                 for (ny in max(0, y - 1)..min(layer.height - 1, y + 1)) {
                     for (nx in max(0, x - 1)..min(layer.width - 1, x + 1)) {
                         val neighbor = ny * layer.width + nx
-                        val alpha = layer.pixels[neighbor] ushr 24
+                        val alpha = layer.alpha[neighbor].toInt() and 0xff
                         if (alpha == 0) continue
                         if (alpha > maximumAlpha || states[neighbor].toInt() == 1) {
                             retain = true

@@ -20,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import desu.inugram.InuConfig
 import desu.inugram.core.sticker.StickerFit
+import desu.inugram.core.sticker.StickerFitSnapshotBudget
 import desu.inugram.core.sticker.StickerFitState
 import desu.inugram.core.sticker.StickerRotation
 import org.telegram.messenger.AndroidUtilities
@@ -790,15 +791,26 @@ object StickerTransformHelper {
                     }
                 }
             } catch (e: Exception) {
-                analysisRunning = false
-                if (geometry.complete(token, Result.failure(e))) failed(e)
+                snapshotFailed(token, e)
+            } catch (e: OutOfMemoryError) {
+                snapshotFailed(token, e)
             }
+        }
+
+        private fun snapshotFailed(token: Int, error: Throwable) {
+            analysisRunning = false
+            if (geometry.complete(token, Result.failure(error))) failed(error)
         }
 
         private fun failed(error: Throwable) {
             Log.d("inu-sticker-fit", "Could not snapshot sticker composition", error)
             pendingFit = false
-            BulletinFactory.of(viewer.containerView, null).createErrorBulletin(string(R.string.InuStickerFitFailed)).show()
+            try {
+                BulletinFactory.of(viewer.containerView, null).createErrorBulletin(string(R.string.InuStickerFitFailed)).show()
+            } catch (e: OutOfMemoryError) {
+                // Failure reporting must not crash an editor that is already short of memory.
+                Log.d("inu-sticker-fit", "Not enough memory to show Fit failure", e)
+            }
         }
 
         private data class Snapshot(val layers: List<StickerFit.Layer>, val rectangles: List<List<StickerFit.Point>>, val crop: StickerFit.Rect?)
@@ -806,28 +818,28 @@ object StickerTransformHelper {
         private fun snapshot(content: Matrix): Snapshot {
             val layers = ArrayList<StickerFit.Layer>()
             val rectangles = ArrayList<List<StickerFit.Point>>()
+            val reader = SnapshotReader()
             val image = viewer.centerImage
             val iw = image.imageWidth; val ih = image.imageHeight
             check(iw > 0 && ih > 0)
             // Render the receiver at native resolution to retain EXIF orientation and filtering.
             val bw = image.bitmapWidth.coerceAtLeast(1); val bh = image.bitmapHeight.coerceAtLeast(1)
-            val bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+            val imageMatrix = Matrix(content).apply {
+                preTranslate(image.imageX, image.imageY)
+                preScale(iw / bw, ih / bh)
+            }
             val previewAlpha = image.alpha
             val crossfadeAlpha = image.currentAlpha
             try {
-                val canvas = Canvas(bitmap)
-                canvas.scale(bw / iw, bh / ih)
-                canvas.translate(-image.imageX, -image.imageY)
                 // Mask mode hides this receiver. Measure pixel alpha, not its last preview opacity.
                 image.alpha = 1f
                 image.setCurrentAlpha(1f)
-                image.draw(canvas)
-                val matrix = Matrix(content).apply {
-                    preTranslate(image.imageX, image.imageY)
-                    preScale(iw / bw, ih / bh)
-                }
-                layers.add(layer(bitmap, matrix))
-            } finally { image.alpha = previewAlpha; image.setCurrentAlpha(crossfadeAlpha); bitmap.recycle() }
+                layers.add(reader.render(bw, bh, imageMatrix) { canvas ->
+                    canvas.scale(bw / iw, bh / ih)
+                    canvas.translate(-image.imageX, -image.imageY)
+                    image.draw(canvas)
+                })
+            } finally { image.alpha = previewAlpha; image.setCurrentAlpha(crossfadeAlpha) }
 
             val overlay = viewer.paintingOverlay
             if (overlay != null && overlay.width > 0 && overlay.height > 0) {
@@ -836,7 +848,7 @@ object StickerTransformHelper {
                     preScale(iw / overlay.width, ih / overlay.height)
                 }
                 overlay.bitmap?.takeUnless { it.isRecycled }?.let { paint ->
-                    layers.add(layer(paint, Matrix(overlayMatrix).apply { preScale(overlay.width.toFloat() / paint.width, overlay.height.toFloat() / paint.height) }))
+                    layers.add(reader.copy(paint, Matrix(overlayMatrix).apply { preScale(overlay.width.toFloat() / paint.width, overlay.height.toFloat() / paint.height) }))
                 }
                 for (i in 0 until overlay.childCount) {
                     val child = overlay.getChildAt(i)
@@ -845,8 +857,7 @@ object StickerTransformHelper {
                     if (animatedEntity(child) != null || child is BackupImageView && child.imageReceiver.bitmap == null) {
                         rectangles.add(rectangle(matrix, child.width.toFloat(), child.height.toFloat()))
                     } else {
-                        val raster = Bitmap.createBitmap(child.width, child.height, Bitmap.Config.ARGB_8888)
-                        try { child.draw(Canvas(raster)); layers.add(layer(raster, matrix)) } finally { raster.recycle() }
+                        layers.add(reader.render(child.width, child.height, matrix, child::draw))
                     }
                 }
             }
@@ -862,13 +873,10 @@ object StickerTransformHelper {
                     outline.computeBounds(bounds, true)
                     if (!bounds.isEmpty) {
                         bounds.inset(-1f, -1f)
-                        val raster = Bitmap.createBitmap(ceil(bounds.width()).toInt(), ceil(bounds.height()).toInt(), Bitmap.Config.ARGB_8888)
-                        try {
-                            val canvas = Canvas(raster)
+                        layers.add(reader.render(ceil(bounds.width()).toInt(), ceil(bounds.height()).toInt(), Matrix(content).apply { preTranslate(bounds.left, bounds.top) }) { canvas ->
                             canvas.translate(-bounds.left, -bounds.top)
                             canvas.drawPath(outline, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE })
-                            layers.add(layer(raster, Matrix(content).apply { preTranslate(bounds.left, bounds.top) }))
-                        } finally { raster.recycle() }
+                        })
                     }
                 }
             }
@@ -883,13 +891,36 @@ object StickerTransformHelper {
         }
 
         private fun dpFloat(value: Float) = AndroidUtilities.dp(value).toFloat()
-        private fun layer(bitmap: Bitmap, matrix: Matrix): StickerFit.Layer {
-            val pixels = IntArray(bitmap.width * bitmap.height)
-            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-            val m = FloatArray(9).also(matrix::getValues)
-            return StickerFit.Layer(pixels, bitmap.width, bitmap.height, StickerFit.Affine(
-                m[0].toDouble(), m[3].toDouble(), m[1].toDouble(), m[4].toDouble(), m[2].toDouble(), m[5].toDouble(),
-            ))
+
+        private class SnapshotReader {
+            private val budget = Runtime.getRuntime().let { runtime ->
+                val available = runtime.maxMemory() - runtime.totalMemory() + runtime.freeMemory()
+                // Leave headroom for stock bitmaps, geometry work, and the rest of the editor.
+                StickerFitSnapshotBudget(minOf(48L * 1024 * 1024, runtime.maxMemory() / 4, available / 2))
+            }
+            private val pixels = IntArray(StickerFitSnapshotBudget.COPY_PIXELS)
+
+            fun render(width: Int, height: Int, matrix: Matrix, draw: (Canvas) -> Unit): StickerFit.Layer {
+                budget.reserve(width, height, render = true)
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                return try { draw(Canvas(bitmap)); read(bitmap, matrix) } finally { bitmap.recycle() }
+            }
+
+            fun copy(bitmap: Bitmap, matrix: Matrix): StickerFit.Layer {
+                budget.reserve(bitmap.width, bitmap.height, render = false)
+                return read(bitmap, matrix)
+            }
+
+            private fun read(bitmap: Bitmap, matrix: Matrix): StickerFit.Layer {
+                // Copy exact native alpha in bounded chunks; never retain a stock-owned bitmap.
+                val alpha = StickerFit.copyAlpha(bitmap.width, bitmap.height, pixels) { x, y, width, height ->
+                    bitmap.getPixels(pixels, 0, width, x, y, width, height)
+                }
+                val m = FloatArray(9).also(matrix::getValues)
+                return StickerFit.Layer(alpha, bitmap.width, bitmap.height, StickerFit.Affine(
+                    m[0].toDouble(), m[3].toDouble(), m[1].toDouble(), m[4].toDouble(), m[2].toDouble(), m[5].toDouble(),
+                ))
+            }
         }
 
         private fun rectangle(matrix: Matrix, width: Float, height: Float): List<StickerFit.Point> {
